@@ -1,386 +1,263 @@
-use std::fs;
-use std::io::ErrorKind;  
-use std::path::Path;
+use Asus_control_center::{
+    find_hwmon, find_nvme_hwmons, gpu_mode, kbd_set_brightness, read_battery, read_fan_rpm,
+    read_file, read_number, read_profile, read_temperature, set_battery_charge_limit,
+    set_profile, BATTERY_PATH, PROFILE_CHOICES_PATH,
+};
+use eframe::egui;
 
-struct Gpu {
-    device: String,
-    hwmon: Option<String>,
-}
-
-const DRM_PATH: &str = "/sys/class/drm";
-const HWMON_PATH: &str = "/sys/class/hwmon";
-const BATTERY_PATH: &str = "/sys/class/power_supply/BAT0";
-const PROFILE_PATH: &str = "/sys/firmware/acpi/platform_profile";
-const PROFILE_CHOICES_PATH: &str = "/sys/firmware/acpi/platform_profile_choices";
-const ARMOURY_PATH: &str = "/sys/class/firmware-attributes/asus-armoury/attributes";
-const ASUS_PLATFORM_PATH: &str = "/sys/devices/platform/asus-nb-wmi";
-const KBD_LED_PATH: &str = "/sys/class/leds/asus::kbd_backlight";
-
-fn read_file(path: &str) -> Option<String> {
-    fs::read_to_string(path)
-        .ok()
-        .map(|value| value.trim().to_string())
-}
-
-fn read_number(path: &str) -> Option<f64> {
-    read_file(path)?.parse::<f64>().ok()
-}
-
-fn find_hwmon(name: &str) -> Option<String> {
-    let entries = fs::read_dir(HWMON_PATH).ok()?;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name_path = path.join("name");
-
-        if let Ok(hwmon_name) = fs::read_to_string(name_path) {
-            if hwmon_name.trim() == name {
-                return Some(path.to_string_lossy().into_owned());
-            }
-        }
+fn fmt_opt_f64(val: Option<f64>, unit: &str) -> String {
+    match val {
+        Some(v) => format!("{v:.1}{unit}"),
+        None => "N/A".to_string(),
     }
-
-    None
 }
 
-fn read_temperature(hwmon: &str, file: &str) -> Option<f64> {
-    let path = format!("{}/{}", hwmon, file);
-
-    read_number(&path).map(|value| value / 1000.0)
-}
-
-fn read_fan_rpm(hwmon: &str, file: &str) -> Option<u64> {
-    let path = format!("{}/{}", hwmon, file);
-
-    read_number(&path).map(|value| value as u64)
-}
-
-fn read_battery() -> Option<u64> {
-    let path = format!("{}/capacity", BATTERY_PATH);
-
-    read_number(&path).map(|value| value as u64)
-}
-
-fn read_profile() -> Option<String> {
-    read_file(PROFILE_PATH)
-}
-
-fn find_nvme_hwmons() -> Vec<String> {
-    let mut devices = Vec::new();
-
-    let entries = match fs::read_dir(HWMON_PATH) {
-        Ok(entries) => entries,
-        Err(_) => return devices,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name_path = path.join("name");
-
-        if let Ok(name) = fs::read_to_string(name_path) {
-            if name.trim() == "nvme" {
-                devices.push(path.to_string_lossy().into_owned());
-            }
-        }
+fn fmt_opt_u64(val: Option<u64>, unit: &str) -> String {
+    match val {
+        Some(v) => format!("{v}{unit}"),
+        None => "N/A".to_string(),
     }
-
-    devices.sort();
-    devices
 }
 
-fn clear_screen() {
-    print!("\x1B[2J\x1B[1;1H");
+struct LaptopInfo {
+    cpu_temp: Option<f64>,
+    gpu_temp: Option<f64>,
+    cpu_fan: Option<u64>,
+    gpu_fan: Option<u64>,
+    gpu_power: Option<f64>,
+    ssd1_temp: Option<f64>,
+    ssd2_temp: Option<f64>,
+    battery: Option<u64>,
+    profile: String,
 }
 
-fn print_dashboard() {
+fn read_laptop_info() -> LaptopInfo {
     let cpu_hwmon = find_hwmon("k10temp");
     let gpu_hwmon = find_hwmon("amdgpu");
     let asus_hwmon = find_hwmon("asus");
-
-    let cpu_temp = cpu_hwmon
-        .as_deref()
-        .and_then(|hwmon| read_temperature(hwmon, "temp1_input"));
-
-    let gpu_temp = gpu_hwmon
-        .as_deref()
-        .and_then(|hwmon| read_temperature(hwmon, "temp1_input"));
-
-    let gpu_power = gpu_hwmon
-        .as_deref()
-        .and_then(|hwmon| {
-            read_number(&format!("{}/power1_input", hwmon))
-        })
-        .map(|value| value / 1_000_000.0);
-
-    let cpu_fan = asus_hwmon
-        .as_deref()
-        .and_then(|hwmon| read_fan_rpm(hwmon, "fan1_input"));
-
-    let gpu_fan = asus_hwmon
-        .as_deref()
-        .and_then(|hwmon| read_fan_rpm(hwmon, "fan2_input"));
-
-    let battery = read_battery();
-
-    let profile = read_profile()
-        .unwrap_or_else(|| "unknown".to_string());
-
     let nvme_devices = find_nvme_hwmons();
 
-    let ssd1_temp = nvme_devices
-        .get(0)
-        .and_then(|hwmon| read_temperature(hwmon, "temp1_input"));
-
-    let ssd2_temp = nvme_devices
-        .get(1)
-        .and_then(|hwmon| read_temperature(hwmon, "temp1_input"));
-
-    clear_screen();
-
-
-    print_value("CPU", cpu_temp, "°C");
-    print_value("GPU", gpu_temp, "°C");
-
-    print_integer_value("CPU Fan", cpu_fan, " RPM");
-    print_integer_value("GPU Fan", gpu_fan, " RPM");
-
-    print_value("GPU Power", gpu_power, " W");
-
-    print_value("SSD 1", ssd1_temp, "°C");
-    print_value("SSD 2", ssd2_temp, "°C");
-
-    match battery {
-        Some(value) => {
-            println!(
-                " {:<18} {:>16}% ",
-                "Battery",
-                value
-            );
-        }
-
-        None => {
-            println!(
-                " {:<18} {:>16}  ",
-                "Battery",
-                "N/A"
-            );
-        }
-    }
-
-    
-
-    println!(
-        " {:<18} {:>16}   ",
-        "Profile",
-        profile
-    );
-
-    
-}
-
-fn print_value(
-    label: &str,
-    value: Option<f64>,
-    unit: &str,
-) {
-    match value {
-        Some(value) => {
-            println!(
-                " {:<18} {:>13.1}{} ",
-                label,
-                value,
-                unit
-            );
-        }
-
-        None => {
-            println!(
-                " {:<18} {:>16} ",
-                label,
-                "N/A"
-            );
-        }
+    LaptopInfo {
+        cpu_temp: cpu_hwmon
+            .as_deref()
+            .and_then(|h| read_temperature(h, "temp1_input")),
+        gpu_temp: gpu_hwmon
+            .as_deref()
+            .and_then(|h| read_temperature(h, "temp1_input")),
+        cpu_fan: asus_hwmon
+            .as_deref()
+            .and_then(|h| read_fan_rpm(h, "fan1_input")),
+        gpu_fan: asus_hwmon
+            .as_deref()
+            .and_then(|h| read_fan_rpm(h, "fan2_input")),
+        gpu_power: gpu_hwmon
+            .as_deref()
+            .and_then(|h| read_number(&format!("{h}/power1_input")))
+            .map(|v| v / 1_000_000.0),
+        ssd1_temp: nvme_devices
+            .first()
+            .and_then(|h| read_temperature(h, "temp1_input")),
+        ssd2_temp: nvme_devices
+            .get(1)
+            .and_then(|h| read_temperature(h, "temp1_input")),
+        battery: read_battery(),
+        profile: read_profile().unwrap_or_else(|| "unknown".to_string()),
     }
 }
 
-fn print_integer_value(
-    label: &str,
-    value: Option<u64>,
-    unit: &str,
-) {
-    match value {
-        Some(value) => {
-            println!(
-                " {:<18} {:>13}{} ",
-                label,
-                value,
-                unit
-            );
-        }
+struct ControlGui {
+    info: LaptopInfo,
 
-        None => {
-            println!(
-                " {:<18} {:>16} ",
-                label,
-                "N/A"
-            );
-        }
-    }
+    battery_limit_input: String,
+    gpu_mode_input: String,
+    profile_input: String,
+    kbd_brightness_input: String,
+
+    status_text: String,
+    status_is_error: bool,
 }
 
-// Write to sys file
+impl ControlGui {
+    fn new() -> Self {
+        let current_limit = read_file(&format!("{BATTERY_PATH}/charge_control_end_threshold"))
+            .unwrap_or_else(|| "85".to_string());
+        let current_profile = read_profile().unwrap_or_else(|| "balanced".to_string());
 
-fn write_file(path: &str, value: &str) -> Result<(), String> {
-    fs::write(path, value).map_err(|e| match e.kind() {
-        ErrorKind::PermissionDenied => {
-            format!("{}: permission denied (run with sudo)", path)
-        }
-        ErrorKind::NotFound => {
-            format!("{}: not supported on this machine/kernel", path)
-        }
-        _ => format!("{}: {}", path, e),
-    })
-}
-
-fn exists(path: &str) -> bool {
-    Path::new(path).exists()
-}
-
-// keyboard lightning, no RGB
-
-fn kbd_max_brightness() -> Result<u64, String> {
-    read_number(&format!("{}/max_brightness", KBD_LED_PATH))
-        .map(|v| v as u64)
-        .ok_or_else(|| format!("{} not found: no ASUS keyboard backlight", KBD_LED_PATH))
-}
-
-fn kbd_set_brightness(level: u64) -> Result<(), String> {
-    let max = kbd_max_brightness()?;
-
-    if level > max {
-        return Err(format!("brightness must be 0-{}", max));
-    }
-
-    write_file(&format!("{}/brightness", KBD_LED_PATH), &level.to_string())
-}
-
-fn kbd_on(level: Option<u64>) -> Result<(), String> {
-    let max = kbd_max_brightness()?;
-    kbd_set_brightness(level.unwrap_or(max).max(1))
-}
-
-
-// Platform profiles (quiet, balanced, performance)
-
-fn set_profile(name: &str) -> Result<(), String> {
-    let choices = read_file(PROFILE_CHOICES_PATH).unwrap_or_default();
-    if !choices.split_whitespace().any(|c| c == name) {          
-        return Err(format!("invalid profile '{}'. Choices: {}", name, choices));
-    }
-    write_file(PROFILE_PATH, name)                                     
-}
-
-// GPU control
-
-fn gpu_hwmon_path(device: &str) -> Option<String> {
-    let mut paths: Vec<String> = fs::read_dir(format!("{}/hwmon", device))
-        .ok()?
-        .flatten()
-        .map(|e| e.path().to_string_lossy().into_owned())
-        .collect();
-
-    paths.sort();
-    paths.into_iter().next()
-}
-
-
-fn find_discrete_gpu() -> Option<Gpu> {
-    let mut best: Option<(f64, Gpu)> = None;
-
-    for entry in fs::read_dir(DRM_PATH).ok()?.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-
-        let is_card = name
-            .strip_prefix("card")
-            .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
-            .unwrap_or(false);
-
-        if !is_card {
-            continue;
-        }
-
-        let device = format!("{}/{}/device", DRM_PATH, name);
-
-        if read_file(&format!("{}/vendor", device)).as_deref() != Some("0x1002") {
-            continue;
-        }
-
-        let vram = read_number(&format!("{}/mem_info_vram_total", device)).unwrap_or(0.0);
-        let hwmon = gpu_hwmon_path(&device);
-
-        if best.as_ref().map(|(v, _)| vram > *v).unwrap_or(true) {
-            best = Some((vram, Gpu { device, hwmon }));
+        Self {
+            info: read_laptop_info(),
+            battery_limit_input: current_limit,
+            gpu_mode_input: "hybrid".to_string(),
+            profile_input: current_profile,
+            kbd_brightness_input: "2".to_string(),
+            status_text: "Ready.".to_string(),
+            status_is_error: false,
         }
     }
 
-    best.map(|(_, gpu)| gpu)
-}
-
-
-fn require_gpu() -> Result<Gpu, String> {
-    find_discrete_gpu().ok_or_else(|| "no AMD discrete GPU found".to_string())
-}
-
-fn asus_attr(names: &[&str]) -> Option<String> {
-    for name in names {
-        let armoury = format!("{}/{}/current_value", ARMOURY_PATH, name);
-        if exists(&armoury) {
-            return Some(armoury);
-        }
-
-        let legacy = format!("{}/{}", ASUS_PLATFORM_PATH, name);
-        if exists(&legacy) {
-            return Some(legacy);
-        }
-    }
-
-    None
-}
-
-fn gpu_mode(mode: &str) -> Result<(), String> {
-    let mux = asus_attr(&["gpu_mux_mode"]);
-    let disable = asus_attr(&["dgpu_disable"]).ok_or("dgpu_disable not supported")?;
-
-    match mode {
-        "igpu" => {
-            if let Some(m) = &mux {
-                if read_file(m).as_deref() == Some("0") {
-                    return Err("MUX is in dGPU-only mode: run `gpu_mode(hybrid)`, reboot, then retry".into());
-                }
+    fn record_result(&mut self, action: &str, res: Result<(), String>) {
+        match res {
+            Ok(()) => {
+                self.status_is_error = false;
+                self.status_text = format!("{action}: OK");
+                self.info = read_laptop_info();
             }
-            write_file(&disable, "1")
+            Err(err) => {
+                self.status_is_error = true;
+                self.status_text = format!("{action}: {err}");
+            }
         }
-        "hybrid" => {
-            write_file(&disable, "0")?;                       
-            if let Some(m) = &mux { write_file(m, "1")?; }    
-            Ok(())
-        }
-        "dgpu" => {
-            write_file(&disable, "0")?;                       
-            let m = mux.ok_or("no MUX switch on this laptop")?;
-            write_file(&m, "0")                              
-        }
-        _ => Err("mode must be 'igpu', 'hybrid' or 'dgpu'".into()),
     }
 }
 
+impl eframe::App for ControlGui {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.heading("ASUS Control Center");
+            ui.separator();
 
+            ui.columns(2, |cols| {
+                cols[0].group(|ui| {
+                    ui.heading("Laptop Info");
+                    ui.add_space(4.0);
 
-fn main() {
-        print_dashboard();
+                    egui::Grid::new("info_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("CPU Temp:");
+                            ui.label(fmt_opt_f64(self.info.cpu_temp, " °C"));
+                            ui.end_row();
 
-        // println!("{:?}", kbd_set_brightness(2));
-        // println!("{:?}", set_profile("quiet"));
-        //println!("{:?}", gpu_mode("igpu")) // needs reboot, switching back to hybrid turns off monitor
-        // sudo cargo run
+                            ui.label("GPU Temp:");
+                            ui.label(fmt_opt_f64(self.info.gpu_temp, " °C"));
+                            ui.end_row();
+
+                            ui.label("CPU Fan:");
+                            ui.label(fmt_opt_u64(self.info.cpu_fan, " RPM"));
+                            ui.end_row();
+
+                            ui.label("GPU Fan:");
+                            ui.label(fmt_opt_u64(self.info.gpu_fan, " RPM"));
+                            ui.end_row();
+
+                            ui.label("GPU Power:");
+                            ui.label(fmt_opt_f64(self.info.gpu_power, " W"));
+                            ui.end_row();
+
+                            ui.label("SSD 1 Temp:");
+                            ui.label(fmt_opt_f64(self.info.ssd1_temp, " °C"));
+                            ui.end_row();
+
+                            ui.label("SSD 2 Temp:");
+                            ui.label(fmt_opt_f64(self.info.ssd2_temp, " °C"));
+                            ui.end_row();
+
+                            ui.label("Battery:");
+                            ui.label(fmt_opt_u64(self.info.battery, "%"));
+                            ui.end_row();
+
+                            ui.label("Profile:");
+                            ui.label(&self.info.profile);
+                            ui.end_row();
+                        });
+
+                    ui.add_space(8.0);
+                    if ui.button("Refresh").clicked() {
+                        self.info = read_laptop_info();
+                        self.status_text = "Info refreshed.".to_string();
+                        self.status_is_error = false;
+                    }
+                });
+
+                cols[1].group(|ui| {
+                    ui.heading("Controls");
+                    ui.add_space(4.0);
+
+                    ui.label("Battery Charge Limit (0–100):");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.battery_limit_input);
+                        if ui.button("Set").clicked() {
+                            match self.battery_limit_input.trim().parse::<u32>() {
+                                Ok(val) => {
+                                    let res = set_battery_charge_limit(val);
+                                    self.record_result("Battery limit", res);
+                                }
+                                Err(_) => {
+                                    self.record_result(
+                                        "Battery limit",
+                                        Err("enter a valid number (0-100)".into()),
+                                    );
+                                }
+                            }
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    ui.label("GPU Mode (igpu / hybrid / dgpu):");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.gpu_mode_input);
+                        if ui.button("Set").clicked() {
+                            let mode = self.gpu_mode_input.trim().to_string();
+                            let res = gpu_mode(&mode);
+                            self.record_result("GPU mode", res);
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    let choices = read_file(PROFILE_CHOICES_PATH).unwrap_or_default();
+                    ui.label(format!("Platform Profile ({choices}):"));
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.profile_input);
+                        if ui.button("Set").clicked() {
+                            let prof = self.profile_input.trim().to_string();
+                            let res = set_profile(&prof);
+                            self.record_result("Profile", res);
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    ui.label("Keyboard Backlight Level:");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.kbd_brightness_input);
+                        if ui.button("Set").clicked() {
+                            match self.kbd_brightness_input.trim().parse::<u64>() {
+                                Ok(lvl) => {
+                                    let res = kbd_set_brightness(lvl);
+                                    self.record_result("Backlight", res);
+                                }
+                                Err(_) => {
+                                    self.record_result(
+                                        "Backlight",
+                                        Err("enter a valid integer level".into()),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+
+            let color = if self.status_is_error {
+                egui::Color32::LIGHT_RED
+            } else {
+                egui::Color32::LIGHT_GREEN
+            };
+            ui.colored_label(color, &self.status_text);
+        });
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "ASUS Control Center",
+        options,
+        Box::new(|_cc| Ok(Box::new(ControlGui::new()))),
+    )
 }
